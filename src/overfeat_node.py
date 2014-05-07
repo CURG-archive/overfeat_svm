@@ -82,6 +82,25 @@ def save_sample(sample, filename):
     with open(pickle_path, 'w') as outfile:
         pickle.dump(sample, outfile)
 
+def load_samples():
+    '''
+    loads .pickled samples from ../data/training/
+
+    TODO add classes. restrict loading to certain classes.
+    TODO add datetime range. since filenames are simply datetimes,
+         load filename into datatime and check to make sure in range.
+    '''
+    training_dir = os.abspath("../data/training")
+    for classification in os.listdir(training_dir):
+        classification_path = os.path.join(training_dir, classification)
+        for filename in os.listdir(classification_path):
+            _, extension = os.path.splitext(filename)
+            if extension == ".pickle":
+                pickle_path = os.path.join(classification_path, filename)
+                with open(pickle_path, 'r') as pickle_file:
+                    sample = pickle.load(pickle_file)
+                    add_training_sample(sample)
+
 def save_depth():
     '''TODO maybe better to incorporate this functionality into save_image()'''
     pass
