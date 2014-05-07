@@ -111,14 +111,25 @@ def add_training_sample(sample):
         classes.append(sample.classification)
     training.append(sample)
 
-def add_training_image(classification, do_save_image=True, do_save_sample=True):
+def continuously_save_training_data(classification):
+    print "classifying: ", classification
+    while True:
+        in = raw_input("scan? (y/n): ").lower()
+        if in == "y":
+            save_training_data(classification)
+        elif in == "n":
+            return
+        else:
+            print "input y or n"
+            continue
+
+def save_training_data(classification, do_save_image=True, do_save_sample=True):
     '''
     adds the current kinect frame features to our training Samples.
     also saves the image and feature data if specified.
     '''
     time = datetime.now()
     filename = time.strftime("%Y-%m-%d-%H-%M-%S-%f")
-    print filename
 
     # partially apply our save image fcn to be used inside of preprocess()
     save_processed_image_func = partial(
@@ -134,7 +145,7 @@ def add_training_image(classification, do_save_image=True, do_save_sample=True):
 
     # create sample, add it to training list, write it to file for re-use
     sample = Sample(features, classification, time)
-    add_training_sample(sample)
+    #add_training_sample(sample)
     if do_save_sample:
         save_sample(sample, filename)
 
