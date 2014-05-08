@@ -1,15 +1,21 @@
 #!/usr/bin/env python
 
-import numpy as np, rospy, overfeat, os, pickle
-from copy import copy
+import numpy as np, pylab as pl, rospy, overfeat, os, cPickle
+from copy import copy, deepcopy
 from collections import namedtuple
 from functools import partial
 from datetime import datetime
+from multiprocessing import Process
 
 from sensor_msgs.msg import Image
 from rospy.numpy_msg import numpy_msg
 from scipy.misc import imresize, imsave
 from sklearn import svm
+from sklearn.cross_validation import KFold, cross_val_score
+
+OVERFEAT_DIM = 231
+KINECT_WIDTH  = 640
+KINECT_HEIGHT = 480
 
 # initialize overfeat. 0 = fast net, 1 = accurate net.
 overfeat.init("../data/weights/net_weight_0", 0)
@@ -19,40 +25,81 @@ overfeat.init("../data/weights/net_weight_0", 0)
 classes  = []
 
 # list of training samples.
-# each Sample is features data and the target of a classification.
-Sample = namedtuple('Sample', ['data','classification','time'])
 training = []
 
-# will train svm classifier on features extracted using overfeat
-classifier = svm.SVC()
+# each Sample is features data and the target of a classification.
+Sample = namedtuple('Sample', ['features','depth','classification','time','image'])
 
-# use `image` in other functions to access kinect frames.
-global image
+# will train svm classifier on features extracted using overfeat
+svm_clf = svm.SVC()
+
+# use `image` and `depth` in other functions to access kinect frames.
 image = None
+depth = None
 
 def listen():
     rospy.init_node("overfeat_preprocessor_node")
 
-    def image_stream(img): 
-        '''
-        perpetually sets the `image` to current kinect perspective. 
-        use `image` in other functions to access kinect frames.
-        '''
+    def image_stream(color_image): 
+        '''perpetually sets the global `image` to what kinect sees.'''
         global image
-        image = img
-
-    # processes kinect stream through image_stream()
+        image = color_image
     rospy.Subscriber("/camera/rgb/image_color", numpy_msg(Image), image_stream)
 
-def train_svm():
+    def depth_stream(depth_image): 
+        '''perpetually sets the `depth` to current kinect depth image.'''
+        global depth
+        depth = depth_image
+    rospy.Subscriber("/camera/depth/image/", Image, depth_stream)
+
+def train_svm(optimize=False):
     '''
     train svm on training Samples. 
     sklearn doesn't have online learning so we have 
     to retrain on the entire data set.
     '''
-    data = [np.array(sample.data) for sample in training]
-    targets = np.array([classes.index(sample.classification) for sample in training])
-    classifier.fit(data, targets)
+
+    X = [np.array(sample.features) for sample in training]
+    y = np.array([classes.index(sample.classification) for sample in training])
+
+    if optimize:
+        optimize_svm_penalty(X,y)
+
+    import pdb; pdb.set_trace();
+    svm_clf.fit(X,y)
+
+def optimize_svm_penalty(X, y, Cs=np.logspace(0,2,100), folds=10):
+    '''
+    set svm penalty param (C) to optimal value using k-fold cv
+    '''
+    kfold = KFold(len(y), folds)
+    scores = []
+    scores_std = []
+
+    start = datetime.now()
+    for C in Cs:
+        svm_clf.C = C
+        scores_c = cross_val_score(svm_clf, X, y, cv=kfold, n_jobs=-1)
+        scores.append(np.mean(scores_c))
+        scores_std.append(np.std(scores_c))
+    print 'runtime %s-fold validation: ' % folds, (datetime.now() - start).total_seconds()
+
+    # set optimal svm penalty
+    svm_clf.C = Cs[scores.index(max(scores))]
+    print 'optimal svm penalty (C): ', svm_clf.C
+
+    # plot k-fold crossvalidation results
+    pl.figure(1, figsize=(4, 3))
+    pl.clf()
+    pl.semilogx(Cs, scores)
+    pl.semilogx(Cs, np.array(scores) + np.array(scores_std), 'b--')
+    pl.semilogx(Cs, np.array(scores) - np.array(scores_std), 'b--')
+    locs, labels = pl.yticks()
+    pl.yticks(locs, map(lambda x: "%g" % x, locs))
+    pl.ylabel('CV score')
+    pl.xlabel('Parameter C')
+    pl.ylim(0, 1.1)
+    pl.show()
 
 def get_and_create_classification_dir(classification):
     '''verifies dir containing classification exists and return formatted dir string'''
@@ -61,28 +108,119 @@ def get_and_create_classification_dir(classification):
         os.makedirs(classification_dir)
     return os.path.abspath(classification_dir)
 
-def save_image(img, classification, filename):
+def add_training_sample(sample):
+    if sample.time in [s.time for s in training]:
+        # skip adding sample if sample with same timestamp is already in training
+        return
+
+    if sample.classification not in classes:
+        # if new classification, add to classes
+        classes.append(sample.classification)
+
+    training.append(sample)
+
+'''
+SCANNING (with the KINECT)
+
+scan functions store data of the current kinect perspective in `scans`.
+when you have finished scanning, run save_scans() to persist the data 
+to the filesystem as .png and .pickle files. load_scans() will load all 
+training data in the /training/data/<classification>/ folders into 
+the `training` list, at which point you can run train_svm().
+'''
+scans = []
+
+def continuously_scan(classification):
+    print "classifying: ", classification
+    while True:
+        key = raw_input("scan? (y/n): ").lower()
+        hit_enter = not key
+        if key == "y" or hit_enter:
+            scan(classification)
+        elif key == "n":
+            return
+
+def scan(classification):
     '''
-    saves a *numpy array* as an image in ../data/training/<classification>/<filename>.<suffix>.png.
-    TODO change from saving a numpy array to something more robust. currently just 
-         using this fcn for viewing by hand rather than storing for reprocessing.
-
-    classification
-        the string describing the object
+    adds the current kinect frame features to our training Samples.
+    also saves the image and feature data if specified.
     '''
-    classification_dir = get_and_create_classification_dir(classification)
-    filename = filename + ".png"
-    image_path = os.path.join(classification_dir, filename)
-    imsave(image_path, img)
+    time = datetime.now()
 
-def save_sample(sample, filename):
-    classification_dir = get_and_create_classification_dir(sample.classification)
-    filename = filename + ".pickle"
-    pickle_path = os.path.join(classification_dir, filename)
-    with open(pickle_path, 'w') as outfile:
-        pickle.dump(sample, outfile)
+    # get image and depth
+    decoded_image = np.fromstring(image.data, np.uint8)
+    decoded_depth = np.fromstring(depth.data, dtype=np.float32)
 
-def load_samples():
+    scans.append({
+        'classification': classification,
+        'depth': decoded_depth,
+        'image': decoded_image,
+        'time': time,
+    })
+
+def save_scans():
+    '''
+    save all scans to .png and .pickle files.
+    job runs in the background.
+    each scan gets its own pickle (and image, of course).
+    '''
+
+    def save_scan(classification, image, depth, time):
+        '''
+        save individual scan to png and pickle. the pickle is merely a 
+        dump of the Sample namedtuple. overfeat feature extaction is 
+        performed before creating the Sample and therefore before pickling.
+        '''
+        # reshape image and depth 
+        reshaped_img   = np.reshape(image, (KINECT_HEIGHT, KINECT_WIDTH, 3))
+        reshaped_depth = np.reshape(depth, (KINECT_HEIGHT, KINECT_WIDTH, 1))
+
+        # resize and rearrange image RGB order for overfeat
+        resized    = imresize(reshaped_img, (OVERFEAT_DIM, OVERFEAT_DIM)).astype(np.float32)
+        flattened  = resized.reshape(OVERFEAT_DIM*OVERFEAT_DIM, 3)
+        rearranged = flattened.transpose().reshape(3, OVERFEAT_DIM, OVERFEAT_DIM)
+
+        # extract image features via overfeat
+        _, features = run_overfeat(rearranged)
+
+        # save resized image
+        filename = time.strftime("%Y-%m-%d-%H-%M-%S-%f")
+        save_image(resized, classification, filename)
+
+        # create sample and write it to file
+        sample = Sample(features, reshaped_depth, classification, time, reshaped_img)
+        save_sample(sample, filename)
+
+    def save_image(img, classification, filename):
+        '''saves a *numpy array* as an png to ../data/training/<classification>/<filename>.png'''
+        classification_dir = get_and_create_classification_dir(classification)
+        filename = filename + ".png"
+        image_path = os.path.join(classification_dir, filename)
+        imsave(image_path, img)
+
+    def save_sample(sample, filename):
+        '''pickles a sample to ../data/training/<classification>/<filename>.pickle'''
+        classification_dir = get_and_create_classification_dir(sample.classification)
+        filename = filename + ".pickle"
+        pickle_path = os.path.join(classification_dir, filename)
+        with open(pickle_path, 'w') as outfile:
+            cPickle.dump(sample, outfile)
+
+    # copy and reset `scans` so we can continue scanning
+    scans_copy = deepcopy(scans)
+    global scans
+    scans = []
+
+    # run save_scans() on each scan in background process
+    def run_save_scans(scans):
+        for scan in scans_copy:
+            save_scan(**scan)
+    p = Process(
+        target = run_save_scans,
+        args = (scans_copy,)),
+    p.start()
+
+def load_scans():
     '''
     loads .pickled samples from ../data/training/
 
@@ -90,7 +228,8 @@ def load_samples():
     TODO add datetime range. since filenames are simply datetimes,
          load filename into datatime and check to make sure in range.
     '''
-    training_dir = os.abspath("../data/training")
+    start = datetime.now()
+    training_dir = os.path.abspath("../data/training")
     for classification in os.listdir(training_dir):
         classification_path = os.path.join(training_dir, classification)
         for filename in os.listdir(classification_path):
@@ -98,56 +237,9 @@ def load_samples():
             if extension == ".pickle":
                 pickle_path = os.path.join(classification_path, filename)
                 with open(pickle_path, 'r') as pickle_file:
-                    sample = pickle.load(pickle_file)
+                    sample = cPickle.load(pickle_file)
                     add_training_sample(sample)
-
-def save_depth():
-    '''TODO maybe better to incorporate this functionality into save_image()'''
-    pass
-
-def add_training_sample(sample):
-    if sample.classification not in classes:
-        # if new classification, add to classes
-        classes.append(sample.classification)
-    training.append(sample)
-
-def continuously_save_training_data(classification):
-    print "classifying: ", classification
-    while True:
-        in = raw_input("scan? (y/n): ").lower()
-        if in == "y":
-            save_training_data(classification)
-        elif in == "n":
-            return
-        else:
-            print "input y or n"
-            continue
-
-def save_training_data(classification, do_save_image=True, do_save_sample=True):
-    '''
-    adds the current kinect frame features to our training Samples.
-    also saves the image and feature data if specified.
-    '''
-    time = datetime.now()
-    filename = time.strftime("%Y-%m-%d-%H-%M-%S-%f")
-
-    # partially apply our save image fcn to be used inside of preprocess()
-    save_processed_image_func = partial(
-        save_image, 
-        classification = classification,
-        filename = "%s.%s" % (filename, "processed"),
-    ) if do_save_image else None
-
-    # extract image features via overfeat and write to file if specified
-    global image
-    processed = preprocess(image, save_processed_image_func)
-    _, features = run_overfeat(processed)
-
-    # create sample, add it to training list, write it to file for re-use
-    sample = Sample(features, classification, time)
-    #add_training_sample(sample)
-    if do_save_sample:
-        save_sample(sample, filename)
+    print 'runtime load_scans(): ', (datetime.now() - start).total_seconds()
 
 def predict(method="svm", n=1):
     ''' 
@@ -158,14 +250,21 @@ def predict(method="svm", n=1):
     n
         returns multiple guesses. only works for method="overfeat"
     '''
-    processed = preprocess(image)
-    feats, likelihoods = run_overfeat(processed)
+    # resize image and rearrange RGB order for overfeat
+    decoded = np.fromstring(image.data, np.uint8)
+    reshaped = np.reshape(decoded, (image.height, image.width, 3))
+    resized = imresize(reshaped, (OVERFEAT_DIM,OVERFEAT_DIM)).astype(np.float32)
+    flattened  = resized.reshape(OVERFEAT_DIM*OVERFEAT_DIM, 3)
+    rearranged = flattened.transpose().reshape(3, OVERFEAT_DIM, OVERFEAT_DIM)
+
+    # extract features
+    likelihoods, features = run_overfeat(rearranged)
 
     if method == "overfeat":
         for prediction in overfeat_predictions(likelihoods, n):
             print prediction
     elif method == "svm":
-        target = int(classifier.predict([feats])[0])
+        target = int(svm_clf.predict([features])[0])
         print classes[target]
 
 def run_overfeat(image, layer=None):
@@ -184,8 +283,8 @@ def run_overfeat(image, layer=None):
     overfeat_features     = overfeat.get_output(feature_layer)
 
     # flatten and copy. NOTE: copy() is intentional, don't delete.
-    formatted_likelihoods = copy(overfeat_features.flatten())
-    formatted_features    = copy(overfeat_likelihoods.flatten())
+    formatted_features    = copy(overfeat_features.flatten())
+    formatted_likelihoods = copy(overfeat_likelihoods.flatten())
     return formatted_likelihoods, formatted_features
 
 def overfeat_predictions(likelihoods, n=1):
@@ -206,6 +305,7 @@ def overfeat_predictions(likelihoods, n=1):
 
 def preprocess(image, save_func=None):
     '''
+    TODO FIX THIS SHIT
     prepare an image for overfeat.
 
     save_func function params: 
@@ -214,7 +314,7 @@ def preprocess(image, save_func=None):
     save_func should already know what filename to save as.
     '''
     # decode image data from string
-    decoded  = np.fromstring(image.data, np.uint8)
+    # decoded  = np.fromstring(image.data, np.uint8)
     reshaped = np.reshape(decoded, (image.height, image.width, 3))
 
     # resize image for overfeat
@@ -225,6 +325,6 @@ def preprocess(image, save_func=None):
         save_func(resized)
 
     # rearrange RGB order
-    flattened  = resized.reshape(dim*dim, 3)
-    rearranged = flattened.transpose().reshape(3, dim, dim)
+    flattened  = resized.reshape(OVERFEAT_DIM*OVERFEAT_DIM, 3)
+    rearranged = flattened.transpose().reshape(3, OVERFEAT_DIM, OVERFEAT_DIM)
     return rearranged
