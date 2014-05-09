@@ -1,17 +1,18 @@
 #!/usr/bin/env python
 
-import numpy as np, pylab as pl, rospy, overfeat, os, cPickle
+import numpy as np, pylab as pl, rospy, overfeat, os, cPickle, cv2
 from copy import copy, deepcopy
 from collections import namedtuple
 from functools import partial
 from datetime import datetime
-from multiprocessing import Process
+from multiprocessing import Process, Pool
 
 from sensor_msgs.msg import Image
 from rospy.numpy_msg import numpy_msg
 from scipy.misc import imresize, imsave
 from sklearn import svm
-from sklearn.cross_validation import KFold, cross_val_score
+from sklearn.cross_validation import StratifiedKFold, cross_val_score
+from skimage.feature import hog
 
 OVERFEAT_DIM = 231
 KINECT_WIDTH  = 640
@@ -31,7 +32,7 @@ training = []
 Sample = namedtuple('Sample', ['features','depth','classification','time','image'])
 
 # will train svm classifier on features extracted using overfeat
-svm_clf = svm.SVC()
+svm_clf = svm.LinearSVC()
 
 # use `image` and `depth` in other functions to access kinect frames.
 image = None
@@ -52,7 +53,7 @@ def listen():
         depth = depth_image
     rospy.Subscriber("/camera/depth/image/", Image, depth_stream)
 
-def train_svm(optimize=False):
+def train_svm(include_depth=False, optimize=False):
     '''
     train svm on training Samples. 
     sklearn doesn't have online learning so we have 
@@ -62,27 +63,59 @@ def train_svm(optimize=False):
     X = [np.array(sample.features) for sample in training]
     y = np.array([classes.index(sample.classification) for sample in training])
 
-    if optimize:
-        optimize_svm_penalty(X,y)
+    if include_depth:
+        pool = Pool()
+        depths = pool.map(depth_features, [s.depth for s in training])
+        pool.close()
+        pool.join()
 
-    import pdb; pdb.set_trace();
+    folds = 10
+    skfold = StratifiedKFold(y, folds)
+
+    if optimize:
+        optimize_svm_penalty(X,y,skfold)
+    else:
+        # previously calculated optimal penalty
+        svm_clf.C = 6.75
+
+    cv_score = np.mean(cross_val_score(svm_clf, X, y, cv=skfold, n_jobs=-1))
+    print 'cv score (%s folds): ' % folds, cv_score
+
     svm_clf.fit(X,y)
 
-def optimize_svm_penalty(X, y, Cs=np.logspace(0,2,100), folds=10):
+def depth_features(depth_img):
+    '''
+    fill in np.nan holes using cv2.inpaint,
+    then return histogram of oriented gradients
+    '''
+    start = datetime.now()
+    mask   = np.isnan(depth_img).astype(np.uint8)
+    normed = (255.0 * depth_img / np.nanmax(depth_img)).astype(np.uint8) 
+    filled = cv2.inpaint(normed, mask, 8, cv2.INPAINT_NS)
+    hogged = hog(filled, pixels_per_cell=(40,40), cells_per_block=(2,2))
+    print 'runtime depth_features(): ', (datetime.now() - start).total_seconds()
+    return hogged
+
+Cs = np.linspace(.01, 7, 30)
+scores = []
+scores_std = []
+def optimize_svm_penalty(X, y, cv):
     '''
     set svm penalty param (C) to optimal value using k-fold cv
     '''
-    kfold = KFold(len(y), folds)
-    scores = []
-    scores_std = []
+    print 'svm optimization started'
+
+    global Cs
+    global scores
+    global scores_std
 
     start = datetime.now()
     for C in Cs:
         svm_clf.C = C
-        scores_c = cross_val_score(svm_clf, X, y, cv=kfold, n_jobs=-1)
+        scores_c = cross_val_score(svm_clf, X, y, cv=cv, n_jobs=-1)
         scores.append(np.mean(scores_c))
         scores_std.append(np.std(scores_c))
-    print 'runtime %s-fold validation: ' % folds, (datetime.now() - start).total_seconds()
+    print 'runtime %s-fold validation: ' % cv.k, (datetime.now() - start).total_seconds()
 
     # set optimal svm penalty
     svm_clf.C = Cs[scores.index(max(scores))]
@@ -91,9 +124,9 @@ def optimize_svm_penalty(X, y, Cs=np.logspace(0,2,100), folds=10):
     # plot k-fold crossvalidation results
     pl.figure(1, figsize=(4, 3))
     pl.clf()
-    pl.semilogx(Cs, scores)
-    pl.semilogx(Cs, np.array(scores) + np.array(scores_std), 'b--')
-    pl.semilogx(Cs, np.array(scores) - np.array(scores_std), 'b--')
+    pl.plot(Cs, scores)
+    pl.plot(Cs, np.array(scores) + np.array(scores_std), 'b--')
+    pl.plot(Cs, np.array(scores) - np.array(scores_std), 'b--')
     locs, labels = pl.yticks()
     pl.yticks(locs, map(lambda x: "%g" % x, locs))
     pl.ylabel('CV score')
@@ -207,8 +240,8 @@ def save_scans():
             cPickle.dump(sample, outfile)
 
     # copy and reset `scans` so we can continue scanning
-    scans_copy = deepcopy(scans)
     global scans
+    scans_copy = deepcopy(scans)
     scans = []
 
     # run save_scans() on each scan in background process
@@ -223,12 +256,16 @@ def save_scans():
 def load_scans():
     '''
     loads .pickled samples from ../data/training/
+    note: this is *slow*. 2 mins. write entire loaded training
+    list to single pickle and unpickle from that single file.
 
     TODO add classes. restrict loading to certain classes.
     TODO add datetime range. since filenames are simply datetimes,
          load filename into datatime and check to make sure in range.
     '''
     start = datetime.now()
+
+    # get all pickle files
     training_dir = os.path.abspath("../data/training")
     for classification in os.listdir(training_dir):
         classification_path = os.path.join(training_dir, classification)
@@ -239,7 +276,26 @@ def load_scans():
                 with open(pickle_path, 'r') as pickle_file:
                     sample = cPickle.load(pickle_file)
                     add_training_sample(sample)
+
     print 'runtime load_scans(): ', (datetime.now() - start).total_seconds()
+
+    '''
+    def unpickle(pickle_path):
+        """expensive depickling in own fcn to be done in parallel"""
+        with open(pickle_path, 'r') as pickle_file:
+            sample = cPickle.load(pickle_file)
+            return sample
+    
+    # concurrently unpickle training data
+    pool = Pool(8)
+    unpickled = pool.map(unpickle, pickle_paths)
+    pool.close()
+    pool.join()
+
+    # properly handle adding samples to global training list
+    for sample in unpickled:
+        add_training_sample(sample)
+    '''
 
 def predict(method="svm", n=1):
     ''' 
