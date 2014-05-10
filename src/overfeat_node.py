@@ -45,13 +45,13 @@ def listen():
         '''perpetually sets the global `image` to what kinect sees.'''
         global image
         image = color_image
-    rospy.Subscriber("/camera/rgb/image_color", numpy_msg(Image), image_stream)
+    rospy.Subscriber("/camera/rgb/image_color", numpy_msg(Image), image_stream, queue_size=1)
 
     def depth_stream(depth_image): 
         '''perpetually sets the `depth` to current kinect depth image.'''
         global depth
         depth = depth_image
-    rospy.Subscriber("/camera/depth/image/", Image, depth_stream)
+    rospy.Subscriber("/camera/depth/image/", Image, depth_stream, queue_size=1)
 
 def train_svm(include_depth=False, optimize=False):
     '''
@@ -59,27 +59,44 @@ def train_svm(include_depth=False, optimize=False):
     sklearn doesn't have online learning so we have 
     to retrain on the entire data set.
     '''
-
-    X = [np.array(sample.features) for sample in training]
+    X = np.array([np.array(sample.features)            for sample in training])
     y = np.array([classes.index(sample.classification) for sample in training])
 
     if include_depth:
+        # concurrently extract depth features
         pool = Pool()
-        depths = pool.map(depth_features, [s.depth for s in training])
+        depth_feats = pool.map(depth_features, [s.depth for s in training])
         pool.close()
         pool.join()
+        # concat depth features to training data
+        X = np.concatenate((X,depth_feats),axis=1)
 
     folds = 10
     skfold = StratifiedKFold(y, folds)
 
     if optimize:
+        # note: only re-run optimization when training data changes
         optimize_svm_penalty(X,y,skfold)
     else:
-        # previously calculated optimal penalty
-        svm_clf.C = 6.75
+        # set previously calculated optimal penalty
+        clf_type = type(svm_clf)
+        if clf_type == svm.SVC:
+            if include_depth:
+                # optimized over costs = np.linspace(21, 26, 15)
+                # 97.921% CV score
+                svm_clf.C = 24.143
+            else:
+                # optimized over costs = np.linspace(2, 12, 60)
+                # 97.732% CV score
+                svm_clf.C = 6.781
+        elif clf_type == svm.LinearSVC:
+            # optimized over costs = np.linspace(.001, .05, 20)
+            # 98.301% CV score
+            svm_clf.C = 0.015
 
     cv_score = np.mean(cross_val_score(svm_clf, X, y, cv=skfold, n_jobs=-1))
-    print 'cv score (%s folds): ' % folds, cv_score
+    print 'SVM type: %s' % type(svm_clf)
+    print 'CV score (%s folds): ' % folds, cv_score
 
     svm_clf.fit(X,y)
 
@@ -88,26 +105,27 @@ def depth_features(depth_img):
     fill in np.nan holes using cv2.inpaint,
     then return histogram of oriented gradients
     '''
-    start = datetime.now()
     mask   = np.isnan(depth_img).astype(np.uint8)
     normed = (255.0 * depth_img / np.nanmax(depth_img)).astype(np.uint8) 
     filled = cv2.inpaint(normed, mask, 8, cv2.INPAINT_NS)
     hogged = hog(filled, pixels_per_cell=(40,40), cells_per_block=(2,2))
-    print 'runtime depth_features(): ', (datetime.now() - start).total_seconds()
     return hogged
 
-Cs = np.linspace(.01, 7, 30)
-scores = []
-scores_std = []
 def optimize_svm_penalty(X, y, cv):
-    '''
-    set svm penalty param (C) to optimal value using k-fold cv
-    '''
+    '''optimize svm penalty param (C) using provided sklearn.cross_validation iterator'''
     print 'svm optimization started'
 
-    global Cs
-    global scores
-    global scores_std
+    # penalty ranges selected from testing and used to graphing optimization process. 
+    # train_svm(optimize=False) will already set svm_clf.C to the pre-calculated optimal 
+    # value and you should only reoptimize if you change the training data.
+    clf_type = type(svm_clf)
+    if clf_type == svm.SVC:
+        Cs = np.linspace(.01, 8, 60)
+    elif clf_type == svm.LinearSVC:
+        Cs = np.linspace(.001, .05, 20)
+
+    scores = []
+    scores_std = []
 
     start = datetime.now()
     for C in Cs:
@@ -127,8 +145,9 @@ def optimize_svm_penalty(X, y, cv):
     pl.plot(Cs, scores)
     pl.plot(Cs, np.array(scores) + np.array(scores_std), 'b--')
     pl.plot(Cs, np.array(scores) - np.array(scores_std), 'b--')
-    locs, labels = pl.yticks()
-    pl.yticks(locs, map(lambda x: "%g" % x, locs))
+    locs = np.linspace(0,1,6)
+    labels = ['0', '.2','.4','.6','.8','1']
+    pl.yticks(locs, labels)
     pl.ylabel('CV score')
     pl.xlabel('Parameter C')
     pl.ylim(0, 1.1)
@@ -358,29 +377,3 @@ def overfeat_predictions(likelihoods, n=1):
     predictions = sorted(predictions, key=lambda x: -x.likelihood)
 
     return [overfeat.get_class_name(pred.name_index) for pred in predictions[0:n]]
-
-def preprocess(image, save_func=None):
-    '''
-    TODO FIX THIS SHIT
-    prepare an image for overfeat.
-
-    save_func function params: 
-        image: image to be saved.
-
-    save_func should already know what filename to save as.
-    '''
-    # decode image data from string
-    # decoded  = np.fromstring(image.data, np.uint8)
-    reshaped = np.reshape(decoded, (image.height, image.width, 3))
-
-    # resize image for overfeat
-    dim = 231
-    resized = imresize(reshaped, (dim,dim)).astype(np.float32)
-
-    if save_func:
-        save_func(resized)
-
-    # rearrange RGB order
-    flattened  = resized.reshape(OVERFEAT_DIM*OVERFEAT_DIM, 3)
-    rearranged = flattened.transpose().reshape(3, OVERFEAT_DIM, OVERFEAT_DIM)
-    return rearranged
