@@ -1,3 +1,4 @@
+*.ipynb
 src/.ipynb_checkpoints/
 data/
 *.swp
